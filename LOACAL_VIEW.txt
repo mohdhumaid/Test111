@@ -1,0 +1,1879 @@
+import json
+from datetime import datetime
+from functools import wraps
+from pathlib import Path
+
+from django.conf import settings
+from django.http import FileResponse, JsonResponse
+from django.shortcuts import get_object_or_404, render
+from django.utils import timezone
+from django.views.decorators.http import require_POST
+from openpyxl import load_workbook
+
+from .models import Product, Sheet, RateCardHistory
+from .services import (
+    sheet_to_dict,
+    rebuild_sheet,
+    validate_dict,
+    export_csv,
+    eff_stamp,
+    parse_csv_to_dict,
+)
+
+
+# ============================================================
+# SECURITY CONFIGURATION
+# ============================================================
+
+TRC_APP_LABEL = "rates"
+
+PERM_ACCESS_TRC = f"{TRC_APP_LABEL}.access_trc"
+PERM_SAVE_DRAFT = f"{TRC_APP_LABEL}.save_trc_draft"
+PERM_PUBLISH = f"{TRC_APP_LABEL}.publish_trc_rates"
+PERM_UPLOAD = f"{TRC_APP_LABEL}.upload_trc_rates"
+PERM_EDIT_PUBLISHED = f"{TRC_APP_LABEL}.edit_trc_published"
+
+# Maximum allowed CSV upload size = 1 MB
+MAX_UPLOAD_SIZE = 1 * 1024 * 1024
+
+
+# ============================================================
+# RBAC DECORATOR
+# ============================================================
+
+def permission_required_json(permission):
+    """
+    Server-side Role-Based Access Control.
+
+    Rules:
+    1. User must be authenticated.
+    2. Superuser is allowed.
+    3. Staff/Admin is allowed.
+    4. Normal user must have required permission.
+    5. Otherwise HTTP 403 is returned.
+    """
+
+    def decorator(view_func):
+
+        @wraps(view_func)
+        def _wrapped_view(request, *args, **kwargs):
+
+            # Authentication check
+            if not request.user.is_authenticated:
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "errors": ["Authentication required."],
+                    },
+                    status=401,
+                )
+
+            # Superuser access
+            if request.user.is_superuser:
+                return view_func(request, *args, **kwargs)
+
+            # Existing staff/admin access
+            if request.user.is_staff:
+                return view_func(request, *args, **kwargs)
+
+            # Explicit permission-based authorization
+            if request.user.has_perm(permission):
+                return view_func(request, *args, **kwargs)
+
+            # User is authenticated but not authorized
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "errors": [
+                        "Forbidden: You are not authorized to perform this operation."
+                    ],
+                },
+                status=403,
+            )
+
+        return _wrapped_view
+
+    return decorator
+
+
+# ============================================================
+# ROLE-SPECIFIC DECORATORS
+# ============================================================
+
+def trc_access_required(view_func):
+    """
+    Permission required for dashboard, rates API and history.
+    """
+    return permission_required_json(PERM_ACCESS_TRC)(view_func)
+
+
+def trc_draft_required(view_func):
+    """
+    Permission required for saving working draft.
+    """
+    return permission_required_json(PERM_SAVE_DRAFT)(view_func)
+
+
+def trc_publish_required(view_func):
+    """
+    Permission required for publishing rates.
+    """
+    return permission_required_json(PERM_PUBLISH)(view_func)
+
+
+def trc_upload_required(view_func):
+    """
+    Permission required for uploading published CSV.
+    """
+    return permission_required_json(PERM_UPLOAD)(view_func)
+
+
+def trc_edit_published_required(view_func):
+    """
+    Permission required for editing published rates.
+    """
+    return permission_required_json(PERM_EDIT_PUBLISHED)(view_func)
+
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def save_history_snapshot(product, sheet_dict):
+    """
+    Save/update historical rate-card snapshot.
+    """
+
+    if not product or not sheet_dict:
+        return
+
+    eff_date = sheet_dict.get("effectiveDate") or "Default"
+
+    RateCardHistory.objects.update_or_create(
+        product=product,
+        effective_date=eff_date,
+        defaults={
+            "snapshot": sheet_dict,
+        },
+    )
+
+
+def _sheet(slug, kind):
+    """
+    Get required Sheet object for a product.
+    """
+
+    product = get_object_or_404(
+        Product,
+        slug=slug,
+    )
+
+    return get_object_or_404(
+        Sheet,
+        product=product,
+        kind=kind,
+    )
+    
+def _is_trc_admin(user):
+    """
+    Return True when the current user has TRC administrative access.
+    """
+    return (
+        user.is_superuser
+        or user.is_staff
+        or user.has_perm(PERM_PUBLISH)
+        or user.has_perm(PERM_UPLOAD)
+        or user.has_perm(PERM_EDIT_PUBLISHED)
+    )
+    
+# ============================================================
+# APPLICATION HOME PAGE
+# ============================================================
+
+@trc_access_required
+def home(request):
+    """
+    Main TRC landing page displayed after successful login.
+    """
+    return render(
+        request,
+        "rates/home.html",
+        {
+            "is_admin": _is_trc_admin(request.user),
+        },
+    )
+    
+    
+def _format_retail_excel_value(
+    value,
+    row_index,
+    column_index,
+):
+    """
+    Format Retail workbook values for dashboard display.
+
+    Excel percentage cells may contain values such as 0.0305,
+    which must be displayed as 3.05%.
+    """
+    if value is None:
+        return "-"
+
+    if isinstance(value, datetime):
+        return value.strftime("%d-%b-%Y")
+
+    if isinstance(value, bool):
+        return str(value)
+
+    if isinstance(value, (int, float)):
+        numeric_value = float(value)
+
+        # Do not convert the first column because it contains tenure
+        # or row labels.
+        if (
+            row_index > 1
+            and column_index > 0
+            and 0 < numeric_value < 1
+        ):
+            percentage_value = numeric_value * 100
+
+            return (
+                f"{percentage_value:.2f}"
+                .rstrip("0")
+                .rstrip(".")
+                + "%"
+            )
+
+        if numeric_value.is_integer():
+            return str(int(numeric_value))
+
+        return (
+            f"{numeric_value:.4f}"
+            .rstrip("0")
+            .rstrip(".")
+        )
+
+    text = str(value).strip()
+
+    return text or "-"
+
+def _bulk_workbook_path():
+    """
+    Return the absolute path of the generated Bulk workbook.
+    """
+    return (
+        Path(settings.BASE_DIR)
+        / "rates"
+        / "comparison_engine"
+        / BULK_WORKBOOK_NAME
+    )
+    
+def _nre_nro_workbook_path():
+    """
+    Return the absolute path of the generated NRE/NRO workbook.
+    """
+    return (
+        Path(settings.BASE_DIR)
+        / "rates"
+        / "comparison_engine"
+        / NRE_NRO_WORKBOOK_NAME
+    )
+    
+    
+
+
+
+
+
+# ============================================================
+# RETAIL COMPARISON HELPERS
+# ============================================================
+
+# ============================================================
+# NRE/NRO COMPARISON CONFIGURATION
+# ============================================================
+
+NRE_NRO_WORKBOOK_NAME = "AU_NRE_NRO_Rate_Comparison.xlsx"
+
+NRE_NRO_SHEET_CONFIG = [
+    {
+        "key": "comparison",
+        "label": "NRE/NRO Comparison",
+        "sheet_name": "NRE NRO Comparison",
+    },
+    {
+        "key": "peak_rates",
+        "label": "Peak Rates",
+        "sheet_name": "NRE NRO Peak Rates",
+    },
+]
+
+BULK_WORKBOOK_NAME = "AU_Bulk_TD_Rate_Comparison.xlsx"
+
+BULK_SHEET_CONFIG = [
+    {
+        "key": "three_to_ten",
+        "label": "3 Cr to 10 Cr",
+        "sheet_name": "3-10 Cr",
+    },
+    {
+        "key": "ten_and_above",
+        "label": "10 Cr and Above",
+        "sheet_name": "10 Cr and Above",
+    },
+]
+RETAIL_WORKBOOK_NAME = "AU_FD_Rate_Comparison.xlsx"
+
+RETAIL_SHEET_CONFIG = [
+    {
+        "key": "regular",
+        "label": "Regular Comparison",
+        "sheet_name": "Regular Comparison",
+    },
+    {
+        "key": "senior",
+        "label": "Senior Citizen Comparison",
+        "sheet_name": "Senior Citizen Comparison",
+    },
+    {
+        "key": "regular_peak",
+        "label": "Regular Peak Rates",
+        "sheet_name": "Regular Peak Rates",
+    },
+    {
+        "key": "senior_peak",
+        "label": "Senior Peak Rates",
+        "sheet_name": "Senior Peak Rates",
+    },
+]
+
+
+def _retail_workbook_path():
+    """
+    Return the absolute path of the generated Retail workbook.
+    """
+    return (
+        Path(settings.BASE_DIR)
+        / "rates"
+        / "comparison_engine"
+        / RETAIL_WORKBOOK_NAME
+    )
+
+
+def _clean_excel_value(value):
+    """
+    Convert an Excel value into a JSON/template-safe display value.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, datetime):
+        return value.strftime("%d-%b-%Y")
+
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+
+    return str(value).strip()
+
+
+def _to_numeric_rate(value):
+    """
+    Convert a workbook value into a comparable interest-rate number.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().replace("%", "")
+
+        if not text:
+            return None
+
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return None
+
+    # Excel percentage storage:
+    # 0.0305 means 3.05%
+    if 0 <= number < 1:
+        return round(number * 100, 4)
+
+    if 1 <= number <= 20:
+        return round(number, 4)
+
+    return None
+
+def _trim_excel_matrix(matrix):
+    """
+    Remove:
+
+    1. Completely blank rows.
+    2. Completely blank columns, including blank columns
+       appearing between populated workbook columns.
+
+    A column is removed only when every cell in that column
+    is empty. Columns containing even one value are preserved.
+    """
+
+    # --------------------------------------------------------
+    # REMOVE COMPLETELY EMPTY ROWS
+    # --------------------------------------------------------
+
+    non_empty_rows = []
+
+    for row in matrix:
+        row_values = list(row)
+
+        has_value = any(
+            value is not None
+            and str(value).strip() != ""
+            for value in row_values
+        )
+
+        if has_value:
+            non_empty_rows.append(row_values)
+
+    if not non_empty_rows:
+        return []
+
+    # --------------------------------------------------------
+    # NORMALIZE ROW LENGTHS
+    # --------------------------------------------------------
+
+    maximum_column_count = max(
+        len(row)
+        for row in non_empty_rows
+    )
+
+    normalized_rows = []
+
+    for row in non_empty_rows:
+        missing_column_count = (
+            maximum_column_count - len(row)
+        )
+
+        normalized_rows.append(
+            row + [None] * missing_column_count
+        )
+
+    # --------------------------------------------------------
+    # IDENTIFY FULLY BLANK COLUMNS
+    # --------------------------------------------------------
+
+    populated_column_indexes = []
+
+    for column_index in range(
+        maximum_column_count
+    ):
+        column_has_value = any(
+            row[column_index] is not None
+            and str(row[column_index]).strip() != ""
+            for row in normalized_rows
+        )
+
+        if column_has_value:
+            populated_column_indexes.append(
+                column_index
+            )
+
+    if not populated_column_indexes:
+        return []
+
+    # --------------------------------------------------------
+    # KEEP ONLY POPULATED COLUMNS
+    # --------------------------------------------------------
+
+    cleaned_matrix = []
+
+    for row in normalized_rows:
+        cleaned_row = [
+            row[column_index]
+            for column_index
+            in populated_column_indexes
+        ]
+
+        cleaned_matrix.append(
+            cleaned_row
+        )
+
+    return cleaned_matrix
+
+def _remove_dashboard_note_rows(
+    matrix,
+    stop_markers=None,
+):
+    """
+    Remove workbook notes, legends and explanation sections
+    from the web dashboard.
+
+    Once a configured marker is found, that row and all rows
+    below it are excluded from the dashboard.
+
+    The original Excel workbook is not modified.
+    """
+    if not matrix:
+        return []
+
+    if not stop_markers:
+        return matrix
+
+    normalized_markers = [
+        str(marker).strip().casefold()
+        for marker in stop_markers
+        if str(marker).strip()
+    ]
+
+    cleaned_rows = []
+
+    for row in matrix:
+        row_values = list(row)
+
+        row_text = " ".join(
+            str(value).strip()
+            for value in row_values
+            if value is not None
+            and str(value).strip()
+        ).casefold()
+
+        should_stop = any(
+            marker in row_text
+            for marker in normalized_markers
+        )
+
+        if should_stop:
+            break
+
+        cleaned_rows.append(row_values)
+
+    return cleaned_rows
+
+
+def _build_retail_sheet_data(
+    worksheet,
+    header_row_count=2,
+    stop_markers=None,
+):
+    """
+    Convert an OpenPyXL worksheet into dashboard-ready data.
+
+    Features:
+    - Supports configurable header-row counts.
+    - Removes legend and explanatory sections.
+    - Removes completely blank rows and columns.
+    - Formats percentage and date values.
+    - Identifies the maximum applicable rate in each data row.
+
+    This function does not modify the source Excel workbook.
+    """
+    raw_matrix = list(
+        worksheet.iter_rows(
+            values_only=True,
+        )
+    )
+
+    # Remove legends, colour logic and explanation sections.
+    raw_matrix = _remove_dashboard_note_rows(
+        matrix=raw_matrix,
+        stop_markers=stop_markers,
+    )
+
+    # Remove completely empty rows and columns.
+    raw_matrix = _trim_excel_matrix(
+        raw_matrix
+    )
+
+    if not raw_matrix:
+        return {
+            "rows": [],
+            "row_count": 0,
+            "column_count": 0,
+        }
+
+    display_rows = []
+
+    for row_index, raw_row in enumerate(raw_matrix):
+        numeric_rates = []
+
+        # The first column usually contains the tenure
+        # or descriptive row label.
+        for column_index, value in enumerate(
+            raw_row[1:],
+            start=1,
+        ):
+            numeric_value = _to_numeric_rate(
+                value
+            )
+
+            if numeric_value is not None:
+                numeric_rates.append(
+                    {
+                        "column_index": column_index,
+                        "value": numeric_value,
+                    }
+                )
+
+        maximum_rate = None
+
+        # Maximum-rate highlighting applies only to data rows.
+        if (
+            row_index >= header_row_count
+            and numeric_rates
+        ):
+            maximum_rate = max(
+                item["value"]
+                for item in numeric_rates
+            )
+
+        cells = []
+
+        for column_index, value in enumerate(raw_row):
+            display_value = _format_retail_excel_value(
+                value=value,
+                row_index=row_index,
+                column_index=column_index,
+            )
+
+            numeric_value = _to_numeric_rate(
+                value
+            )
+
+            is_maximum = (
+                row_index >= header_row_count
+                and column_index > 0
+                and maximum_rate is not None
+                and numeric_value is not None
+                and numeric_value == maximum_rate
+            )
+
+            raw_display_value = ""
+
+            if value is not None:
+                raw_display_value = str(
+                    value
+                ).strip()
+
+            cells.append(
+                {
+                    "value": display_value,
+                    "raw_value": raw_display_value,
+                    "is_maximum": is_maximum,
+                    "is_first_column": (
+                        column_index == 0
+                    ),
+                }
+            )
+
+        display_rows.append(
+            {
+                "index": row_index,
+                "is_header": (
+                    row_index < header_row_count
+                ),
+                "cells": cells,
+            }
+        )
+
+    column_count = max(
+        len(row["cells"])
+        for row in display_rows
+    )
+
+    return {
+        "rows": display_rows,
+        "row_count": len(display_rows),
+        "column_count": column_count,
+    }
+
+def _load_retail_dashboard_data():
+    """
+    Load the configured Retail workbook sheets.
+
+    The workbook is opened in read-only mode and is never modified.
+    This function always returns a dictionary.
+    """
+    workbook_path = _retail_workbook_path()
+
+    result = {
+        "available": False,
+        "error": None,
+        "sheets": [],
+        "updated_at": None,
+        "size": None,
+    }
+
+    if not workbook_path.exists():
+        result["error"] = (
+            "Retail comparison workbook has not been generated yet."
+        )
+        return result
+
+    workbook = None
+
+    try:
+        workbook_stats = workbook_path.stat()
+
+        result["updated_at"] = timezone.localtime(
+            datetime.fromtimestamp(
+                workbook_stats.st_mtime,
+                tz=timezone.get_current_timezone(),
+            )
+        )
+
+        result["size"] = workbook_stats.st_size
+
+        workbook = load_workbook(
+            filename=workbook_path,
+            read_only=True,
+            data_only=True,
+        )
+
+        for sheet_config in RETAIL_SHEET_CONFIG:
+            configured_sheet_name = sheet_config["sheet_name"]
+
+            if configured_sheet_name not in workbook.sheetnames:
+                result["sheets"].append(
+                    {
+                        "key": sheet_config["key"],
+                        "label": sheet_config["label"],
+                        "sheet_name": configured_sheet_name,
+                        "available": False,
+                        "error": (
+                            f"Sheet '{configured_sheet_name}' "
+                            "was not found in the workbook."
+                        ),
+                        "rows": [],
+                        "row_count": 0,
+                        "column_count": 0,
+                    }
+                )
+                continue
+
+            worksheet = workbook[configured_sheet_name]
+
+            sheet_data = _build_retail_sheet_data(
+    worksheet=worksheet,
+    header_row_count=2,
+    stop_markers=[
+        "Colour logic",
+        "Color logic",
+        "AU Bank rate is higher",
+        "AU Bank rate is lower",
+        "Rates are equal",
+        "Rate category",
+        "Tenure rule",
+    ],
+)
+
+            result["sheets"].append(
+                {
+                    "key": sheet_config["key"],
+                    "label": sheet_config["label"],
+                    "sheet_name": configured_sheet_name,
+                    "available": True,
+                    "error": None,
+                    "rows": sheet_data["rows"],
+                    "row_count": sheet_data["row_count"],
+                    "column_count": sheet_data["column_count"],
+                }
+            )
+
+        result["available"] = True
+        result["error"] = None
+
+    except Exception as exc:
+        result["available"] = False
+        result["error"] = (
+            "Unable to read the Retail comparison workbook. "
+            f"Reason: {exc}"
+        )
+        result["sheets"] = []
+
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    return result
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+@trc_access_required
+def dashboard(request):
+    """
+    Main TRC dashboard.
+    """
+
+    data = {}
+
+    ordered_slugs = [
+        "fin_callable",
+        "callable",
+        "noncallable",
+        "ib_callable",
+        "ib_noncallable",
+    ]
+
+    products = list(Product.objects.all())
+
+    products.sort(
+        key=lambda p: (
+            ordered_slugs.index(p.slug)
+            if p.slug in ordered_slugs
+            else 99
+        )
+    )
+
+    for product in products:
+
+        published_sheet = product.sheets.filter(
+            kind=Sheet.PUBLISHED
+        ).first()
+
+        working_sheet = product.sheets.filter(
+            kind=Sheet.WORKING
+        ).first()
+
+        if published_sheet:
+            published_dict = sheet_to_dict(published_sheet)
+        else:
+            published_dict = {}
+
+        if working_sheet:
+            working_dict = sheet_to_dict(working_sheet)
+        else:
+            working_dict = {}
+
+        data[product.slug] = {
+            "published": published_dict,
+            "working": working_dict,
+        }
+
+        if not product.history.exists() and published_dict:
+            save_history_snapshot(
+                product,
+                published_dict,
+            )
+
+    # Used by frontend to show/hide Admin controls
+    is_admin = (
+        request.user.is_superuser
+        or request.user.is_staff
+        or request.user.has_perm(PERM_PUBLISH)
+        or request.user.has_perm(PERM_UPLOAD)
+        or request.user.has_perm(PERM_EDIT_PUBLISHED)
+    )
+
+    return render(
+        request,
+        "rates/dashboard.html",
+        {
+            "data_json": json.dumps(data),
+            "is_admin": is_admin,
+        },
+    )
+
+
+# ============================================================
+# SAVE DRAFT
+# ============================================================
+
+@trc_draft_required
+@require_POST
+def save_draft(request, slug):
+    """
+    Save working draft.
+    """
+
+    try:
+        payload = json.loads(request.body or "{}")
+
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": ["Invalid JSON payload."],
+            },
+            status=400,
+        )
+
+    sheet_data = payload.get("sheet", {})
+
+    errors = validate_dict(sheet_data)
+
+    if errors:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": errors,
+            },
+            status=400,
+        )
+
+    working_sheet = _sheet(
+        slug,
+        Sheet.WORKING,
+    )
+
+    rebuild_sheet(
+        working_sheet,
+        sheet_data,
+    )
+
+    updated_working_sheet = _sheet(
+        slug,
+        Sheet.WORKING,
+    )
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "message": "File saved - Draft sent to Admin",
+            "working": sheet_to_dict(updated_working_sheet),
+        }
+    )
+
+
+# ============================================================
+# PUBLISH RATES
+# ============================================================
+
+@trc_publish_required
+@require_POST
+def publish(request, slug):
+    """
+    Publish rates.
+
+    Restricted to staff/admin or user with publish permission.
+    """
+
+    try:
+        payload = json.loads(request.body or "{}")
+
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": ["Invalid JSON payload."],
+            },
+            status=400,
+        )
+
+    try:
+
+        sheet_data = payload.get("sheet", {})
+
+        errors = validate_dict(sheet_data)
+
+        if errors:
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "errors": errors,
+                },
+                status=400,
+            )
+
+        product = get_object_or_404(
+            Product,
+            slug=slug,
+        )
+
+        # Update working sheet
+        rebuild_sheet(
+            _sheet(
+                slug,
+                Sheet.WORKING,
+            ),
+            sheet_data,
+        )
+
+        # Update published sheet
+        rebuild_sheet(
+            _sheet(
+                slug,
+                Sheet.PUBLISHED,
+            ),
+            sheet_data,
+        )
+
+        published_sheet = _sheet(
+            slug,
+            Sheet.PUBLISHED,
+        )
+
+        published_dict = sheet_to_dict(
+            published_sheet
+        )
+
+        # Save historical snapshot
+        save_history_snapshot(
+            product,
+            published_dict,
+        )
+
+        # Generate CSV
+        content = export_csv(sheet_data)
+
+        clean_label = (
+            sheet_data
+            .get("productLabel", "rates")
+            .replace(" ", "_")
+            .replace("/", "_")
+        )
+
+        filename = (
+            f"{clean_label}_rates_"
+            f"{eff_stamp(sheet_data.get('effectiveDate'))}.csv"
+        )
+
+        working_dict = sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.WORKING,
+            )
+        )
+
+        return JsonResponse(
+            {
+                "ok": True,
+                "filename": filename,
+                "content": content,
+                "published": published_dict,
+                "working": working_dict,
+            }
+        )
+
+    except Exception:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Unable to publish rates."
+                ],
+            },
+            status=500,
+        )
+
+
+# ============================================================
+# UPLOAD PUBLISHED CSV
+# ============================================================
+
+@trc_upload_required
+@require_POST
+def upload_published(request, slug):
+    """
+    Upload published rate CSV.
+
+    Security:
+    - Authentication
+    - RBAC
+    - POST only
+    - Maximum 1 MB file size
+    - CSV extension validation
+    """
+
+    # --------------------------------------------------------
+    # FILE PRESENCE
+    # --------------------------------------------------------
+
+    if "file" not in request.FILES:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "No CSV file was uploaded."
+                ],
+            },
+            status=400,
+        )
+
+    csv_file = request.FILES["file"]
+
+    # --------------------------------------------------------
+    # FILE SIZE
+    # --------------------------------------------------------
+
+    if csv_file.size > MAX_UPLOAD_SIZE:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "File size exceeds the maximum allowed limit of 1 MB."
+                ],
+            },
+            status=400,
+        )
+
+    if csv_file.size == 0:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Uploaded file is empty."
+                ],
+            },
+            status=400,
+        )
+
+    # --------------------------------------------------------
+    # FILE EXTENSION
+    # --------------------------------------------------------
+
+    filename = csv_file.name or ""
+
+    if not filename.lower().endswith(".csv"):
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Only CSV files are allowed."
+                ],
+            },
+            status=400,
+        )
+
+    # --------------------------------------------------------
+    # PROCESS CSV
+    # --------------------------------------------------------
+
+    try:
+
+        csv_bytes = csv_file.read()
+
+        csv_text = csv_bytes.decode(
+            "utf-8-sig"
+        )
+
+        product = get_object_or_404(
+            Product,
+            slug=slug,
+        )
+
+        sheet_data = parse_csv_to_dict(
+            csv_text,
+            product.slug,
+            product.label,
+        )
+
+        errors = validate_dict(
+            sheet_data
+        )
+
+        if errors:
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "errors": errors,
+                },
+                status=400,
+            )
+
+        # Update published sheet
+        rebuild_sheet(
+            _sheet(
+                slug,
+                Sheet.PUBLISHED,
+            ),
+            sheet_data,
+        )
+
+        # Update working sheet
+        rebuild_sheet(
+            _sheet(
+                slug,
+                Sheet.WORKING,
+            ),
+            sheet_data,
+        )
+
+        published_dict = sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.PUBLISHED,
+            )
+        )
+
+        working_dict = sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.WORKING,
+            )
+        )
+
+        # Maintain history
+        save_history_snapshot(
+            product,
+            published_dict,
+        )
+
+        return JsonResponse(
+            {
+                "ok": True,
+                "published": published_dict,
+                "working": working_dict,
+            }
+        )
+
+    except UnicodeDecodeError:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Invalid CSV encoding. Please upload a valid UTF-8 CSV file."
+                ],
+            },
+            status=400,
+        )
+
+    except Exception:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Unable to process the uploaded CSV file."
+                ],
+            },
+            status=400,
+        )
+
+
+# ============================================================
+# SAVE PUBLISHED RATES
+# ============================================================
+
+@trc_edit_published_required
+@require_POST
+def save_published(request, slug):
+    """
+    Save manual changes to published rates.
+    """
+
+    try:
+        payload = json.loads(request.body or "{}")
+
+    except json.JSONDecodeError:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Invalid JSON payload."
+                ],
+            },
+            status=400,
+        )
+
+    sheet_data = payload.get(
+        "sheet",
+        {},
+    )
+
+    errors = validate_dict(
+        sheet_data
+    )
+
+    if errors:
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": errors,
+            },
+            status=400,
+        )
+
+    product = get_object_or_404(
+        Product,
+        slug=slug,
+    )
+
+    rebuild_sheet(
+        _sheet(
+            slug,
+            Sheet.PUBLISHED,
+        ),
+        sheet_data,
+    )
+
+    published_dict = sheet_to_dict(
+        _sheet(
+            slug,
+            Sheet.PUBLISHED,
+        )
+    )
+
+    save_history_snapshot(
+        product,
+        published_dict,
+    )
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "published": published_dict,
+        }
+    )
+
+
+# ============================================================
+# GET CURRENT RATES API
+# ============================================================
+
+@trc_access_required
+def get_rates_api(request):
+    """
+    Return latest published and working rates.
+
+    Restricted to authorized TRC users.
+    """
+
+    data = {}
+
+    products = Product.objects.all().order_by("id")
+
+    for product in products:
+
+        published_sheet = product.sheets.filter(
+            kind=Sheet.PUBLISHED
+        ).first()
+
+        working_sheet = product.sheets.filter(
+            kind=Sheet.WORKING
+        ).first()
+
+        if published_sheet:
+            published_dict = sheet_to_dict(
+                published_sheet
+            )
+        else:
+            published_dict = {}
+
+        if working_sheet:
+            working_dict = sheet_to_dict(
+                working_sheet
+            )
+        else:
+            working_dict = {}
+
+        data[product.slug] = {
+            "published": published_dict,
+            "working": working_dict,
+        }
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "data": data,
+        }
+    )
+
+
+# ============================================================
+# HISTORY LIST API
+# ============================================================
+
+@trc_access_required
+def get_history_list(request, slug):
+    """
+    Return historical effective dates for a product.
+
+    Restricted to authorized TRC users.
+    """
+
+    product = get_object_or_404(
+        Product,
+        slug=slug,
+    )
+
+    histories = product.history.all()
+
+    if not histories.exists():
+
+        published_sheet = product.sheets.filter(
+            kind=Sheet.PUBLISHED
+        ).first()
+
+        if published_sheet:
+
+            published_dict = sheet_to_dict(
+                published_sheet
+            )
+
+            save_history_snapshot(
+                product,
+                published_dict,
+            )
+
+            histories = product.history.all()
+
+    data = [
+        {
+            "id": history.id,
+            "effective_date": history.effective_date,
+            "updated_at": history.created_at.strftime(
+                "%d-%b-%Y %H:%M"
+            ),
+        }
+        for history in histories
+    ]
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "history": data,
+        }
+    )
+
+
+# ============================================================
+# HISTORY DETAIL API
+# ============================================================
+
+@trc_access_required
+def get_history_detail(request, history_id):
+    """
+    Return historical rate-card snapshot.
+
+    Restricted to authorized TRC users.
+    """
+
+    history = get_object_or_404(
+        RateCardHistory,
+        id=history_id,
+    )
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "snapshot": history.snapshot,
+            "effective_date": history.effective_date,
+        }
+    )
+    
+    
+
+# ============================================================
+# RATE COMPARISON VIEWS
+# ============================================================
+
+
+@trc_access_required
+def retail_comparison(request):
+    """
+    Display the Retail comparison workbook as a TRC dashboard.
+    """
+    retail_data = _load_retail_dashboard_data()
+
+    return render(
+        request,
+        "rates/comparison/retail.html",
+        {
+            "is_admin": _is_trc_admin(request.user),
+            "workbook_available": retail_data["available"],
+            "workbook_error": retail_data["error"],
+            "workbook_updated_at": retail_data["updated_at"],
+            "workbook_size": retail_data["size"],
+            "retail_sheets": retail_data["sheets"],
+        },
+    )
+    
+def _load_comparison_dashboard_data(
+    workbook_path,
+    sheet_config,
+    module_label,
+):
+    """
+    Load configured workbook sheets for comparison dashboards.
+
+    Supported dashboards:
+    - Retail TD
+    - Bulk TD
+    - NRE/NRO TD
+
+    Bulk worksheets use four header rows.
+    Retail and NRE/NRO worksheets use two header rows.
+
+    This function always returns a dictionary.
+    """
+    result = {
+        "available": False,
+        "error": None,
+        "sheets": [],
+        "updated_at": None,
+        "size": None,
+    }
+
+    # --------------------------------------------------------
+    # WORKBOOK EXISTENCE CHECK
+    # --------------------------------------------------------
+
+    if not workbook_path.exists():
+        result["error"] = (
+            f"{module_label} comparison workbook "
+            "has not been generated yet."
+        )
+        return result
+
+    workbook = None
+
+    try:
+        # ----------------------------------------------------
+        # WORKBOOK FILE INFORMATION
+        # ----------------------------------------------------
+
+        workbook_stats = workbook_path.stat()
+
+        result["updated_at"] = timezone.localtime(
+            datetime.fromtimestamp(
+                workbook_stats.st_mtime,
+                tz=timezone.get_current_timezone(),
+            )
+        )
+
+        result["size"] = workbook_stats.st_size
+
+        # ----------------------------------------------------
+        # OPEN WORKBOOK
+        # ----------------------------------------------------
+
+        workbook = load_workbook(
+            filename=workbook_path,
+            read_only=True,
+            data_only=True,
+        )
+
+        # ----------------------------------------------------
+        # HEADER ROW CONFIGURATION
+        # ----------------------------------------------------
+
+        # ----------------------------------------------------
+# MODULE-SPECIFIC DASHBOARD CONFIGURATION
+# ----------------------------------------------------
+
+        if module_label == "Bulk TD":
+            header_row_count = 4
+
+            stop_markers = [
+                "Legend",
+                "Lower than AU",
+                "Higher than AU",
+                "Equal to AU",
+                "Underlined = peak rate",
+                "Each cell = maximum published rate",
+            ]
+
+        elif module_label == "Retail TD":
+            header_row_count = 2
+
+            stop_markers = [
+                "Colour logic",
+                "Color logic",
+                "AU Bank rate is higher",
+                "AU Bank rate is lower",
+                "Rates are equal",
+                "Rate category",
+                "Tenure rule",
+            ]
+
+        elif module_label == "NRE/NRO TD":
+            header_row_count = 2
+
+            stop_markers = [
+                "Colour logic",
+                "Color logic",
+                "Rate category",
+                "Tenure rule",
+                "Source Files",
+                "Legend",
+"Lower than AU",
+"Higher than AU",
+"Equal to AU",
+"Underlined = peak rate",
+"Each cell = maximum published rate"
+            ]
+
+        else:
+            header_row_count = 2
+            stop_markers = []
+
+        # ----------------------------------------------------
+        # PROCESS CONFIGURED WORKSHEETS
+        # ----------------------------------------------------
+
+        for configured_sheet in sheet_config:
+            sheet_key = configured_sheet["key"]
+            sheet_label = configured_sheet["label"]
+            sheet_name = configured_sheet["sheet_name"]
+
+            # ------------------------------------------------
+            # SHEET EXISTENCE CHECK
+            # ------------------------------------------------
+
+            if sheet_name not in workbook.sheetnames:
+                result["sheets"].append(
+                    {
+                        "key": sheet_key,
+                        "label": sheet_label,
+                        "sheet_name": sheet_name,
+                        "available": False,
+                        "error": (
+                            f"Sheet '{sheet_name}' was not "
+                            "found in the workbook."
+                        ),
+                        "rows": [],
+                        "row_count": 0,
+                        "column_count": 0,
+                    }
+                )
+                continue
+
+            # ------------------------------------------------
+            # LOAD WORKSHEET
+            # ------------------------------------------------
+
+            worksheet = workbook[sheet_name]
+
+            sheet_data = _build_retail_sheet_data(
+                worksheet,
+                header_row_count=header_row_count,
+                stop_markers=stop_markers,
+            )
+
+            # ------------------------------------------------
+            # ADD PROCESSED SHEET DATA
+            # ------------------------------------------------
+
+            result["sheets"].append(
+                {
+                    "key": sheet_key,
+                    "label": sheet_label,
+                    "sheet_name": sheet_name,
+                    "available": True,
+                    "error": None,
+                    "rows": sheet_data.get(
+                        "rows",
+                        [],
+                    ),
+                    "row_count": sheet_data.get(
+                        "row_count",
+                        0,
+                    ),
+                    "column_count": sheet_data.get(
+                        "column_count",
+                        0,
+                    ),
+                }
+            )
+
+        # Workbook itself was loaded successfully.
+        result["available"] = True
+        result["error"] = None
+
+    except Exception as exc:
+        result["available"] = False
+
+        result["error"] = (
+            f"Unable to read the {module_label} "
+            f"comparison workbook. Reason: {exc}"
+        )
+
+        result["sheets"] = []
+
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    return result
+    
+@trc_access_required
+def bulk_comparison(request):
+    """
+    Display the Bulk comparison workbook as a TRC dashboard.
+    """
+    bulk_data = _load_comparison_dashboard_data(
+        workbook_path=_bulk_workbook_path(),
+        sheet_config=BULK_SHEET_CONFIG,
+        module_label="Bulk TD",
+    )
+
+    return render(
+        request,
+        "rates/comparison/bulk.html",
+        {
+            "is_admin": _is_trc_admin(request.user),
+            "workbook_available": bulk_data.get(
+                "available",
+                False,
+            ),
+            "workbook_error": bulk_data.get("error"),
+            "workbook_updated_at": bulk_data.get(
+                "updated_at"
+            ),
+            "workbook_size": bulk_data.get("size"),
+            "bulk_sheets": bulk_data.get(
+                "sheets",
+                [],
+            ),
+        },
+    )
+
+
+@trc_access_required
+def nre_nro_comparison(request):
+    """
+    Display the NRE/NRO comparison workbook as a TRC dashboard.
+    """
+    nre_nro_data = _load_comparison_dashboard_data(
+        workbook_path=_nre_nro_workbook_path(),
+        sheet_config=NRE_NRO_SHEET_CONFIG,
+        module_label="NRE/NRO TD",
+    )
+
+    return render(
+        request,
+        "rates/comparison/nre_nro.html",
+        {
+            "is_admin": _is_trc_admin(request.user),
+            "workbook_available": nre_nro_data.get(
+                "available",
+                False,
+            ),
+            "workbook_error": nre_nro_data.get(
+                "error",
+            ),
+            "workbook_updated_at": nre_nro_data.get(
+                "updated_at",
+            ),
+            "workbook_size": nre_nro_data.get(
+                "size",
+            ),
+            "nre_nro_sheets": nre_nro_data.get(
+                "sheets",
+                [],
+            ),
+        },
+    )
+    
+@trc_access_required
+def download_bulk_comparison(request):
+    """
+    Download the latest generated Bulk comparison workbook.
+    """
+    workbook_path = _bulk_workbook_path()
+
+    if not workbook_path.exists():
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Bulk comparison workbook has not "
+                    "been generated yet."
+                ],
+            },
+            status=404,
+        )
+
+    return FileResponse(
+        workbook_path.open("rb"),
+        as_attachment=True,
+        filename=workbook_path.name,
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+    
+@trc_access_required
+def download_nre_nro_comparison(request):
+    """
+    Download the latest generated NRE/NRO comparison workbook.
+    """
+    workbook_path = _nre_nro_workbook_path()
+
+    if not workbook_path.exists():
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "NRE/NRO comparison workbook has not "
+                    "been generated yet."
+                ],
+            },
+            status=404,
+        )
+
+    return FileResponse(
+        workbook_path.open("rb"),
+        as_attachment=True,
+        filename=workbook_path.name,
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
+# ============================================================
+# RETAIL COMPARISON APIs
+# ============================================================
+
+
+@trc_access_required
+def retail_comparison_status(request):
+    """
+    Return the current Retail workbook status.
+    """
+    workbook_path = _retail_workbook_path()
+
+    if not workbook_path.exists():
+        return JsonResponse(
+            {
+                "ok": True,
+                "available": False,
+                "message": "Retail comparison workbook has not been generated yet.",
+            }
+        )
+
+    file_stats = workbook_path.stat()
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "available": True,
+            "filename": workbook_path.name,
+            "size": file_stats.st_size,
+            "updated_at": file_stats.st_mtime,
+        }
+    )
+
+
+@trc_access_required
+def download_retail_comparison(request):
+    """
+    Download the latest generated Retail comparison workbook.
+    """
+    workbook_path = _retail_workbook_path()
+
+    if not workbook_path.exists():
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    "Retail comparison workbook has not been generated yet."
+                ],
+            },
+            status=404,
+        )
+
+    return FileResponse(
+        workbook_path.open("rb"),
+        as_attachment=True,
+        filename=workbook_path.name,
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+    )
