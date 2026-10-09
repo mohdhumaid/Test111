@@ -1,0 +1,825 @@
+import json
+import os
+from datetime import datetime
+from functools import wraps
+from pathlib import Path
+
+
+from django.conf import settings
+from django.contrib.auth import logout
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse,FileResponse
+from django.shortcuts import render, get_object_or_404, redirect
+from django.utils import timezone
+from django.views.decorators.http import require_POST
+from openpyxl import load_workbook
+from .models import Product, Sheet, RateCardHistory
+
+from .services import (
+    sheet_to_dict,
+    rebuild_sheet,
+    validate_dict,
+    export_csv,
+    export_nominal_csv,
+    stamp,
+    eff_stamp,
+    parse_csv_to_dict,
+    upload_to_s3,
+)
+
+
+# =========================================================
+# DATE FORMATTER HELPER (Converts any date to YYYY-MM-DD)
+# =========================================================
+
+def format_to_yyyy_mm_dd(d_str):
+    """Converts dates like '25-Sep-26' or '25-Sep-2026' to '2026-09-25' (YYYY-MM-DD)."""
+    if not d_str:
+        return d_str
+
+    months = {
+        "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+        "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"
+    }
+
+    # Already YYYY-MM-DD format
+    if "-" in d_str and len(d_str.split("-")[0]) == 4:
+        return d_str
+
+    parts = d_str.split("-")
+    if len(parts) == 3:
+        dd = parts[0].zfill(2)
+        m_part = parts[1].lower()[:3]
+        mm = months.get(m_part, parts[1].zfill(2))
+        yy = parts[2]
+        if len(yy) == 2:
+            yy = "20" + yy
+        return f"{yy}-{mm}-{dd}"
+
+    return d_str
+
+
+# =========================================================
+# SSO LOGOUT
+# =========================================================
+
+def sso_logout(request):
+    logout(request)
+
+    return redirect(
+        "https://ssouat.aubankuat.in/oam/server/logout"
+    )
+
+
+# =========================================================
+# HISTORY SNAPSHOT
+# =========================================================
+
+def save_history_snapshot(product, sheet_dict):
+    if not product or not sheet_dict:
+        return
+
+    eff_date = (
+        sheet_dict.get("effectiveDate")
+        or "Default"
+    )
+
+    RateCardHistory.objects.update_or_create(
+        product=product,
+        effective_date=eff_date,
+        defaults={
+            "snapshot": sheet_dict
+        },
+    )
+
+
+# =========================================================
+# DASHBOARD
+# =========================================================
+
+@login_required
+def dashboard(request):
+
+    data = {}
+
+    ordered_slugs = [
+        "fin_callable",
+        "callable",
+        "noncallable",
+        "ib_callable",
+        "ib_noncallable",
+    ]
+
+    products = list(
+        Product.objects.all()
+    )
+
+    products.sort(
+        key=lambda p: (
+            ordered_slugs.index(p.slug)
+            if p.slug in ordered_slugs
+            else 99
+        )
+    )
+
+    for p in products:
+
+        pub_dict = sheet_to_dict(
+            p.sheets.get(
+                kind=Sheet.PUBLISHED
+            )
+        )
+
+        data[p.slug] = {
+            "published": pub_dict,
+
+            "working": sheet_to_dict(
+                p.sheets.get(
+                    kind=Sheet.WORKING
+                )
+            ),
+        }
+
+        if (
+            not p.history.exists()
+            and pub_dict
+        ):
+            save_history_snapshot(
+                p,
+                pub_dict
+            )
+
+    return render(
+        request,
+        "rates/dashboard.html",
+        {
+            "data_json": json.dumps(
+                data
+            ),
+
+            "is_admin": (
+                request.user.is_staff
+            ),
+        },
+    )
+
+
+# =========================================================
+# SHEET HELPER
+# =========================================================
+
+def _sheet(slug, kind):
+
+    product = get_object_or_404(
+        Product,
+        slug=slug
+    )
+
+    return get_object_or_404(
+        Sheet,
+        product=product,
+        kind=kind
+    )
+
+
+# =========================================================
+# SAVE DRAFT
+# =========================================================
+
+@login_required
+@require_POST
+def save_draft(request, slug):
+    """
+    Persist the working draft for any signed-in user
+    for Admin review.
+    """
+
+    payload = json.loads(
+        request.body or "{}"
+    )
+
+    d = payload.get(
+        "sheet",
+        {}
+    )
+
+    errors = validate_dict(d)
+
+    if errors:
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": errors,
+            },
+            status=400,
+        )
+
+    rebuild_sheet(
+        _sheet(
+            slug,
+            Sheet.WORKING
+        ),
+        d,
+    )
+
+    return JsonResponse({
+        "ok": True,
+
+        "message": (
+            "File saved - Draft sent to Admin"
+        ),
+
+        "working": sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.WORKING
+            )
+        ),
+    })
+
+
+# =========================================================
+# PUBLISH
+# =========================================================
+
+@login_required
+@require_POST
+def publish(request, slug):
+    """
+    Admin only.
+
+    Validates the working draft,
+    copies it to published rates,
+    generates BOTH CSV files (Quarterly + Nominal Monthly),
+    saves local copies to /Input folder,
+    and uploads BOTH CSV files to Amazon S3.
+    """
+
+    # -----------------------------------------------------
+    # Admin authorization
+    # -----------------------------------------------------
+
+    if not request.user.is_staff:
+
+        return JsonResponse(
+            {
+                "ok": False,
+
+                "errors": [
+                    "Only an admin can download "
+                    "and publish rates."
+                ],
+            },
+            status=403,
+        )
+
+
+    # -----------------------------------------------------
+    # Read payload
+    # -----------------------------------------------------
+
+    payload = json.loads(
+        request.body or "{}"
+    )
+
+    d = payload.get(
+        "sheet",
+        {}
+    )
+
+
+    # -----------------------------------------------------
+    # Validate
+    # -----------------------------------------------------
+
+    errors = validate_dict(d)
+
+    if errors:
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": errors,
+            },
+            status=400,
+        )
+
+
+    # -----------------------------------------------------
+    # Save working + published sheet
+    # -----------------------------------------------------
+
+    rebuild_sheet(
+        _sheet(
+            slug,
+            Sheet.WORKING
+        ),
+        d,
+    )
+
+    rebuild_sheet(
+        _sheet(
+            slug,
+            Sheet.PUBLISHED
+        ),
+        d,
+    )
+
+
+    # -----------------------------------------------------
+    # Format EffectiveDate to YYYY-MM-DD (e.g. 2026-09-25) for BOTH exports
+    # -----------------------------------------------------
+
+    d_export = dict(d)
+    d_export["effectiveDate"] = format_to_yyyy_mm_dd(d.get("effectiveDate"))
+
+
+    # -----------------------------------------------------
+    # Generate CSV 1 (Quarterly CSV - EffectiveDate: 2026-09-25)
+    # -----------------------------------------------------
+
+    content1 = export_csv(d_export)
+
+    clean_label = (
+        d.get(
+            "productLabel",
+            "rates"
+        )
+        .replace(
+            " ",
+            "_"
+        )
+        .replace(
+            "/",
+            "_"
+        )
+    )
+
+    timestamp_str = eff_stamp(d.get('effectiveDate'))
+
+    # Filename with 3 underscores: Non_Fin___Fin_Non-Callable_rates_...csv
+    filename1 = (
+        f"{clean_label}_rates_"
+        f"{timestamp_str}.csv"
+    )
+
+
+    # -----------------------------------------------------
+    # Generate CSV 2 (Nominal Monthly CSV - EffectiveDate: 2026-09-25)
+    # -----------------------------------------------------
+
+    content2 = export_nominal_csv(d_export)
+
+    filename2 = (
+        f"{clean_label}_Nominal_Monthly_Rates_"
+        f"{timestamp_str}.csv"
+    )
+
+
+    # -----------------------------------------------------
+    # Save local server copy (Delete same-day older files ONLY for THIS product)
+    # -----------------------------------------------------
+
+    SERVER_EXPORT_DIR = "/Input"
+
+    try:
+        os.makedirs(
+            SERVER_EXPORT_DIR,
+            exist_ok=True
+        )
+
+        # Extract date part (YYYYMMDD) from timestamp_str
+        date_part = timestamp_str.split("_")[0]
+
+        # Delete ONLY same-day old files for THIS specific product (prevents replacing other products)
+        for existing_file in os.listdir(SERVER_EXPORT_DIR):
+            is_same_product = (
+                existing_file.startswith(f"{clean_label}_rates_") or
+                existing_file.startswith(f"{clean_label}_Nominal_Monthly_Rates_")
+            )
+            if is_same_product and f"_{date_part}_" in existing_file:
+                old_file_path = os.path.join(SERVER_EXPORT_DIR, existing_file)
+                if os.path.isfile(old_file_path):
+                    os.remove(old_file_path)
+                    print(f"[REPLACE SUCCESS] Removed same-day old file: {existing_file}")
+
+        # Save new latest files
+        file_path1 = os.path.join(SERVER_EXPORT_DIR, filename1)
+        file_path2 = os.path.join(SERVER_EXPORT_DIR, filename2)
+
+        with open(file_path1, "w", encoding="utf-8") as f:
+            f.write(content1)
+
+        with open(file_path2, "w", encoding="utf-8") as f:
+            f.write(content2)
+
+        print(f"[LOCAL EXPORT SUCCESS] Saved latest {filename1} & {filename2} to {SERVER_EXPORT_DIR}")
+
+    except Exception as exc:
+        print(f"[LOCAL EXPORT ERROR] Local file replace failed: {exc}")
+
+
+    # -----------------------------------------------------
+    # Upload BOTH generated CSV files to S3
+    # -----------------------------------------------------
+
+    s3_success1 = False
+    s3_success2 = False
+
+    try:
+        s3_success1 = upload_to_s3(filename1, content1)
+        s3_success2 = upload_to_s3(filename2, content2)
+
+        if s3_success1 and s3_success2:
+            print(f"[S3 SUCCESS] Both files uploaded to S3: {filename1}, {filename2}")
+        else:
+            print(f"[S3 WARNING] S3 Upload status - File1: {s3_success1}, File2: {s3_success2}")
+
+    except Exception as exc:
+        print(f"[S3 WARNING] S3 upload failed: {exc}")
+
+
+    # -----------------------------------------------------
+    # Return response with BOTH CSV contents for browser
+    # -----------------------------------------------------
+
+    return JsonResponse({
+        "ok": True,
+
+        "filename": filename1,
+        "content": content1,
+
+        "nom_filename": filename2,
+        "nom_content": content2,
+
+        "s3_uploaded": (s3_success1 and s3_success2),
+
+        "published": sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.PUBLISHED
+            )
+        ),
+
+        "working": sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.WORKING
+            )
+        ),
+    })
+
+
+# =========================================================
+# UPLOAD PUBLISHED CSV
+# =========================================================
+
+@login_required
+@require_POST
+def upload_published(request, slug):
+    """
+    Admin only.
+
+    Upload a CSV flat file and directly replace
+    the published rates sheet.
+    """
+
+    if not request.user.is_staff:
+
+        return JsonResponse(
+            {
+                "ok": False,
+
+                "errors": [
+                    "Only an admin can replace "
+                    "published rates."
+                ],
+            },
+            status=403,
+        )
+
+    if "file" not in request.FILES:
+
+        return JsonResponse(
+            {
+                "ok": False,
+
+                "errors": [
+                    "No CSV file was uploaded."
+                ],
+            },
+            status=400,
+        )
+
+    csv_file = request.FILES[
+        "file"
+    ]
+
+    try:
+
+        csv_text = (
+            csv_file
+            .read()
+            .decode(
+                "utf-8-sig",
+                errors="ignore"
+            )
+        )
+
+        product = get_object_or_404(
+            Product,
+            slug=slug
+        )
+
+        d = parse_csv_to_dict(
+            csv_text,
+            product.slug,
+            product.label
+        )
+
+        errors = validate_dict(d)
+
+        if errors:
+
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "errors": errors,
+                },
+                status=400,
+            )
+
+        rebuild_sheet(
+            _sheet(
+                slug,
+                Sheet.PUBLISHED
+            ),
+            d,
+        )
+
+        rebuild_sheet(
+            _sheet(
+                slug,
+                Sheet.WORKING
+            ),
+            d,
+        )
+
+        pub_dict = sheet_to_dict(
+            _sheet(
+                slug,
+                Sheet.PUBLISHED
+            )
+        )
+
+        save_history_snapshot(
+            product,
+            pub_dict
+        )
+
+        return JsonResponse({
+            "ok": True,
+
+            "published": pub_dict,
+
+            "working": sheet_to_dict(
+                _sheet(
+                    slug,
+                    Sheet.WORKING
+                )
+            ),
+        })
+
+    except Exception as exc:
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": [
+                    str(exc)
+                ],
+            },
+            status=400,
+        )
+
+
+# =========================================================
+# SAVE PUBLISHED
+# =========================================================
+
+@login_required
+@require_POST
+def save_published(request, slug):
+    """
+    Admin only.
+
+    Validate and save edits made directly
+    to the published rates sheet.
+    """
+
+    if not request.user.is_staff:
+
+        return JsonResponse(
+            {
+                "ok": False,
+
+                "errors": [
+                    "Only an admin can save "
+                    "published rates."
+                ],
+            },
+            status=403,
+        )
+
+    payload = json.loads(
+        request.body or "{}"
+    )
+
+    d = payload.get(
+        "sheet",
+        {}
+    )
+
+    errors = validate_dict(d)
+
+    if errors:
+
+        return JsonResponse(
+            {
+                "ok": False,
+                "errors": errors,
+            },
+            status=400,
+        )
+
+    product = get_object_or_404(
+        Product,
+        slug=slug
+    )
+
+    rebuild_sheet(
+        _sheet(
+            slug,
+            Sheet.PUBLISHED
+        ),
+        d,
+    )
+
+    pub_dict = sheet_to_dict(
+        _sheet(
+            slug,
+            Sheet.PUBLISHED
+        )
+    )
+
+    save_history_snapshot(
+        product,
+        pub_dict
+    )
+
+    return JsonResponse({
+        "ok": True,
+        "published": pub_dict,
+    })
+
+
+# =========================================================
+# RATES API
+# =========================================================
+
+@login_required
+def get_rates_api(request):
+    """
+    Real-time JSON API endpoint for live polling
+    multi-tab / multi-user draft changes.
+    """
+
+    data = {}
+
+    for p in Product.objects.all().order_by(
+        "id"
+    ):
+
+        data[p.slug] = {
+
+            "published": sheet_to_dict(
+                p.sheets.get(
+                    kind=Sheet.PUBLISHED
+                )
+            ),
+
+            "working": sheet_to_dict(
+                p.sheets.get(
+                    kind=Sheet.WORKING
+                )
+            ),
+        }
+
+    return JsonResponse({
+        "ok": True,
+        "data": data,
+    })
+
+
+# =========================================================
+# HISTORY LIST
+# =========================================================
+
+@login_required
+def get_history_list(request, slug):
+    """
+    Fetch list of all past effective dates
+    for a product.
+    """
+
+    product = get_object_or_404(
+        Product,
+        slug=slug
+    )
+
+    histories = (
+        product.history.all()
+    )
+
+    if not histories.exists():
+
+        pub_sheet = (
+            product
+            .sheets
+            .filter(
+                kind=Sheet.PUBLISHED
+            )
+            .first()
+        )
+
+        if pub_sheet:
+
+            pub_dict = (
+                sheet_to_dict(
+                    pub_sheet
+                )
+            )
+
+            save_history_snapshot(
+                product,
+                pub_dict
+            )
+
+            histories = (
+                product.history.all()
+            )
+
+    data = [
+        {
+            "id": h.id,
+
+            "effective_date": (
+                h.effective_date
+            ),
+
+            "updated_at": (
+                h.created_at.strftime(
+                    "%d-%b-%Y %H:%M"
+                )
+            ),
+        }
+
+        for h in histories
+    ]
+
+    return JsonResponse({
+        "ok": True,
+        "history": data,
+    })
+
+
+# =========================================================
+# HISTORY DETAIL
+# =========================================================
+
+@login_required
+def get_history_detail(
+    request,
+    history_id
+):
+    """
+    Fetch complete JSON snapshot of
+    a specific historical rate card.
+    """
+
+    h = get_object_or_404(
+        RateCardHistory,
+        id=history_id
+    )
+
+    return JsonResponse({
+        "ok": True,
+
+        "snapshot": h.snapshot,
+
+        "effective_date": (
+            h.effective_date
+        ),
+    })
+ 
